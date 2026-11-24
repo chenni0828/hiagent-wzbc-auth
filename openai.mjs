@@ -3,16 +3,32 @@
 import { heldFrom, parse } from "./prompt.mjs"
 
 const enc = new TextEncoder()
+const defaultId = () => "call_" + Math.random().toString(36).slice(2, 14)
+
+function normalizeNativeCalls(toolCalls, makeId) {
+  if (!Array.isArray(toolCalls) || !toolCalls.length) return []
+  return toolCalls
+    .filter((c) => c?.function?.name)
+    .map((c) => ({
+      id: c.id || makeId(),
+      type: "function",
+      function: {
+        name: c.function.name,
+        arguments: c.function.arguments || "{}",
+      },
+    }))
+}
 
 /**
- * Incremental delta tracker that holds back potential <tool_call> prefixes
+ * Incremental delta tracker that holds back potential tool call prefixes
  * while streaming reasoning and content tokens.
  */
 export class Streamer {
-  constructor() {
+  constructor({ parseTools = true } = {}) {
     this.text = ""
     this.shown = 0
     this.reasoning = ""
+    this.parseTools = parseTools
   }
 
   update({ text = "", reasoning = "" } = {}) {
@@ -23,7 +39,7 @@ export class Streamer {
     }
     if (text.startsWith(this.text.slice(0, this.shown))) {
       this.text = text
-      const upto = heldFrom(text)
+      const upto = this.parseTools ? heldFrom(text) : text.length
       if (upto > this.shown) {
         out.content = text.slice(this.shown, upto)
         this.shown = upto
@@ -33,15 +49,23 @@ export class Streamer {
   }
 
   finish(final, newId) {
-    const p = parse(final?.text ?? this.text, newId)
+    const makeId = newId ?? defaultId
+    const native = normalizeNativeCalls(final?.toolCalls, makeId)
     const shown = this.text.slice(0, this.shown)
+    if (!this.parseTools) {
+      const raw = final?.text ?? this.text
+      const content = raw.startsWith(shown) ? raw.slice(shown.length) : ""
+      return { content, calls: native }
+    }
+    const p = parse(final?.text ?? this.text, makeId)
     let content = p.raw.startsWith(shown) ? p.raw.slice(shown.length) : ""
-    if (p.calls.length) {
-      content = content.replace(/```[a-z]*\s*```/gi, "").trim()
-        ? content.replace(/```[a-z]*\s*```/gi, "").trimEnd()
+    const calls = [...native, ...p.calls]
+    if (calls.length) {
+      content = content.replace(/```[a-z0-9_-]*\s*```/gi, "").trim()
+        ? content.replace(/```[a-z0-9_-]*\s*```/gi, "").trimEnd()
         : ""
     }
-    return { content, calls: p.calls }
+    return { content, calls }
   }
 }
 
@@ -85,8 +109,8 @@ const chunk = (id, model, delta, finish = null, extra = {}) =>
  * Pre-stream errors reject before returning the HTTP 200 Response so the caller
  * can emit a proper HTTP error status or trigger re-authentication.
  */
-export async function sse({ id, model, ask, signal, promptTokens = () => 0, newId }) {
-  const st = new Streamer()
+export async function sse({ id, model, ask, signal, promptTokens = () => 0, newId, parseTools = true }) {
+  const st = new Streamer({ parseTools })
   const abort = new AbortController()
   const both = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal
   const buf = []
@@ -179,9 +203,12 @@ export async function sse({ id, model, ask, signal, promptTokens = () => 0, newI
 /**
  * Format a completed HiAgent reply as a non-streaming OpenAI Chat Completion JSON object.
  */
-export function completion({ id, model, final, promptTokens, newId }) {
-  const { text, calls } = parse(final?.text ?? "", newId)
-  const message = { role: "assistant", content: text || (calls.length ? null : "") }
+export function completion({ id, model, final, promptTokens, newId, parseTools = true }) {
+  const makeId = newId ?? defaultId
+  const native = normalizeNativeCalls(final?.toolCalls, makeId)
+  const parsed = parseTools ? parse(final?.text ?? "", makeId) : { text: final?.text ?? "", calls: [] }
+  const calls = [...native, ...parsed.calls]
+  const message = { role: "assistant", content: parsed.text || (calls.length ? null : "") }
   if (final?.reasoning) message.reasoning_content = final.reasoning
   if (calls.length) message.tool_calls = calls
   return {

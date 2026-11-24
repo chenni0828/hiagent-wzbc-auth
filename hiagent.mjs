@@ -393,7 +393,7 @@ export class Session {
         defaultMaxTokens: Number(maxCfg.Default) || 32768,
         reasoning: features.includes("reasoning") || !!m?.Property?.LLM?.API?.Chat?.Features?.includes("reasoning"),
         vision: features.includes("vision"),
-        toolCall: features.includes("tool-call") || !!m?.Property?.LLM?.ToolCall?.Streaming?.Supported,
+        toolCall: true,
       }
     }
     return out
@@ -553,6 +553,7 @@ export class Session {
 
       let text = ""
       let reasoning = ""
+      const nativeCalls = new Map()
       let serverUsage = null
       let finishReason = null
 
@@ -573,15 +574,33 @@ export class Session {
           }
           let deltaText = ""
           let deltaReasoning = ""
+          let sawToolCall = false
           for (const c of chunk?.choices ?? []) {
             if (typeof c?.delta?.content === "string") deltaText += c.delta.content
             if (typeof c?.delta?.reasoning_content === "string") deltaReasoning += c.delta.reasoning_content
+            const tcs = c?.delta?.tool_calls ?? c?.message?.tool_calls
+            if (Array.isArray(tcs)) {
+              for (let i = 0; i < tcs.length; i++) {
+                const tc = tcs[i]
+                if (!tc) continue
+                const idx = Number.isInteger(tc.index) ? tc.index : i
+                let entry = nativeCalls.get(idx)
+                if (!entry) {
+                  entry = { id: "", type: "function", function: { name: "", arguments: "" } }
+                  nativeCalls.set(idx, entry)
+                }
+                if (tc.id) entry.id = tc.id
+                if (tc.function?.name) entry.function.name += tc.function.name
+                if (typeof tc.function?.arguments === "string") entry.function.arguments += tc.function.arguments
+                sawToolCall = true
+              }
+            }
             if (c?.finish_reason) finishReason = c.finish_reason
           }
           if (chunk?.usage && Object.keys(chunk.usage).length) {
             serverUsage = chunk.usage
           }
-          if (deltaText || deltaReasoning) {
+          if (deltaText || deltaReasoning || sawToolCall) {
             text += deltaText
             reasoning += deltaReasoning
             onUpdate?.({ text, reasoning })
@@ -590,7 +609,11 @@ export class Session {
         signal,
       )
 
-      return { text, reasoning, usage: serverUsage, finishReason }
+      const toolCalls = [...nativeCalls.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, c]) => c)
+        .filter((c) => c.function.name)
+      return { text, reasoning, toolCalls, usage: serverUsage, finishReason }
     } finally {
       if (!this.keepHistory) {
         await this.rpc(

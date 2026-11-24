@@ -5,6 +5,11 @@
 
 const OPEN = "<tool_call>"
 const CLOSE = "</tool_call>"
+const KIMI_SEC_OPEN = "<|tool_calls_section_begin|>"
+const KIMI_CALL_OPEN = "<|tool_call_begin|>"
+const MARKERS = [OPEN, KIMI_SEC_OPEN, KIMI_CALL_OPEN]
+const KIMI_CALL_RE =
+  /<\|tool_call_begin\|>\s*([\s\S]*?)\s*<\|tool_call_argument_begin\|>\s*([\s\S]*?)(?:<\|tool_call_end\|>|(?=<\|tool_calls_section_end\|>)|$)/g
 const JSON_KEY = '{"tool_calls"'
 const JSON_AT = /(^|\n)[ \t]*\{\s*"tool_calls"\s*:/g
 
@@ -110,7 +115,11 @@ export function flatten(body) {
     }
   }
   if (turns.length) out.push("# Conversation so far\n\n" + turns.join("\n\n"))
-  out.push("Write the next [assistant] turn now, without the [assistant] label.")
+  out.push(
+    useTools
+      ? `Write the next [assistant] turn now, without the [assistant] label. If calling a tool, output raw ${OPEN}{"name": "<tool>", "arguments": {...}}${CLOSE} blocks directly (no markdown code fence around them).`
+      : "Write the next [assistant] turn now, without the [assistant] label.",
+  )
   return out.join("\n\n")
 }
 
@@ -119,8 +128,7 @@ const inCode = (text, at) => (text.slice(0, at).match(/```/g)?.length ?? 0) % 2 
 function jsonStarts(text) {
   const out = []
   for (const m of text.matchAll(JSON_AT)) {
-    const at = text.indexOf("{", m.index)
-    if (!inCode(text, at)) out.push(at)
+    out.push(text.indexOf("{", m.index))
   }
   return out
 }
@@ -159,7 +167,7 @@ function jsonCalls(v) {
     let args = fn?.arguments ?? {}
     if (typeof args === "string") {
       try {
-        args = JSON.parse(args)
+        args = args.trim() ? JSON.parse(args) : {}
       } catch {
         return null
       }
@@ -171,56 +179,84 @@ function jsonCalls(v) {
   return calls
 }
 
+function backupFence(text, at) {
+  const pre = text.slice(0, at)
+  const fm = pre.match(/(?:^|\n)[ \t]*```[a-z0-9_-]*[ \t]*\r?\n[ \t]*$/i)
+  return fm ? pre.length - fm[0].length + (fm[0].startsWith("\n") ? 1 : 0) : at
+}
+
 /**
  * Return the safe prefix length of `text` to stream before any potential tool call block.
  */
 export function heldFrom(text) {
   let at = -1
-  let pos = 0
-  while ((pos = text.indexOf(OPEN, pos)) >= 0) {
-    if (!inCode(text, pos)) {
-      at = pos
-      break
-    }
-    pos += OPEN.length
+  for (const marker of MARKERS) {
+    const pos = text.indexOf(marker)
+    if (pos >= 0 && (at < 0 || pos < at)) at = pos
   }
   const j = jsonStarts(text)[0]
   if (j !== undefined && (at < 0 || j < at)) at = text.lastIndexOf("\n", j) + 1
-  if (at >= 0) return at
+  if (at >= 0) return backupFence(text, at)
 
   const nl = text.lastIndexOf("\n")
   const line = text.slice(nl + 1)
   const bare = line.replace(/\s+/g, "")
-  if (bare && JSON_KEY.startsWith(bare) && !inCode(text, nl + 1)) return nl + 1
+  if (bare && JSON_KEY.startsWith(bare)) return backupFence(text, nl + 1)
 
-  for (let n = Math.min(OPEN.length - 1, text.length); n > 0; n--) {
-    if (OPEN.startsWith(text.slice(-n)) && !inCode(text, text.length - n)) return text.length - n
+  const fence = text.match(/(?:^|\n)[ \t]*```[a-z0-9_-]*[ \t]*(?:\r?\n[ \t]*)?$/i)
+  if (fence) {
+    const start = text.length - fence[0].length + (fence[0].startsWith("\n") ? 1 : 0)
+    if (!inCode(text, start)) return start
   }
+
+  let tail = text.length
+  for (const marker of MARKERS) {
+    for (let n = Math.min(marker.length - 1, text.length); n > 0; n--) {
+      if (marker.startsWith(text.slice(-n))) {
+        tail = Math.min(tail, text.length - n)
+        break
+      }
+    }
+  }
+  if (tail < text.length) return backupFence(text, tail)
   return text.length
 }
 
-function parseCall(raw) {
+function normalizeCall(v) {
+  const name = v?.name ?? v?.function?.name ?? v?.tool
+  if (typeof name !== "string" || !name.trim()) return null
+  let args = v.arguments ?? v.parameters ?? v.input ?? v.args ?? v.function?.arguments ?? {}
+  if (typeof args === "string") {
+    const trimmed = args.trim()
+    if (!trimmed) args = {}
+    else {
+      try {
+        args = JSON.parse(trimmed)
+      } catch {}
+    }
+  }
+  return { name: name.trim(), arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) }
+}
+
+function parseCalls(raw) {
   const s = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim()
   let v
   try {
     v = JSON.parse(s)
   } catch {
-    return null
+    return []
   }
-  if (Array.isArray(v)) v = v[0]
-  const name = v?.name ?? v?.function?.name ?? v?.tool
-  if (typeof name !== "string" || !name) return null
-  let args = v.arguments ?? v.parameters ?? v.input ?? v.args ?? v.function?.arguments ?? {}
-  if (typeof args === "string") {
-    try {
-      args = JSON.parse(args)
-    } catch {}
+  const list = Array.isArray(v) ? v : Array.isArray(v?.tool_calls) ? v.tool_calls : [v]
+  const out = []
+  for (const item of list) {
+    const c = normalizeCall(item)
+    if (c) out.push(c)
   }
-  return { name, arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) }
+  return out
 }
 
 /**
- * Parse <tool_call> blocks and standalone {"tool_calls": [...]} objects out of a completed reply.
+ * Parse <tool_call> blocks, Kimi native tool-call tags, and standalone {"tool_calls": [...]} objects out of a completed reply.
  */
 export function parse(text, newId = () => "call_" + Math.random().toString(36).slice(2, 14)) {
   const calls = []
@@ -233,18 +269,42 @@ export function parse(text, newId = () => "call_" + Math.random().toString(36).s
       rest += text.slice(i)
       break
     }
-    if (inCode(text, at)) {
-      rest += text.slice(i, at + OPEN.length)
-      i = at + OPEN.length
-      continue
-    }
     rest += text.slice(i, at)
     const end = text.indexOf(CLOSE, at + OPEN.length)
     const raw = text.slice(at + OPEN.length, end < 0 ? text.length : end)
-    const call = parseCall(raw)
-    if (call) calls.push({ id: newId(), type: "function", function: call })
-    else rest += text.slice(at, end < 0 ? text.length : end + CLOSE.length)
+    const found = parseCalls(raw)
+    if (found.length) {
+      for (const c of found) calls.push({ id: newId(), type: "function", function: c })
+    } else {
+      rest += text.slice(at, end < 0 ? text.length : end + CLOSE.length)
+    }
     i = end < 0 ? text.length : end + CLOSE.length
+  }
+
+  let kimiParsed = 0
+  rest = rest.replace(KIMI_CALL_RE, (full, rawName, rawArgs) => {
+    const name = String(rawName ?? "")
+      .trim()
+      .replace(/^functions\./, "")
+      .replace(/:\d+$/, "")
+      .trim()
+    if (!name) return full
+    let args = {}
+    const argText = String(rawArgs ?? "").trim()
+    if (argText) {
+      try {
+        args = JSON.parse(argText)
+      } catch {
+        return full
+      }
+    }
+    if (!args || typeof args !== "object" || Array.isArray(args)) return full
+    calls.push({ id: newId(), type: "function", function: { name, arguments: JSON.stringify(args) } })
+    kimiParsed++
+    return ""
+  })
+  if (kimiParsed > 0) {
+    rest = rest.replace(/<\|tool_calls_section_begin\|>|<\|tool_calls_section_end\|>/g, "")
   }
 
   for (const at of jsonStarts(rest).reverse()) {
@@ -256,6 +316,6 @@ export function parse(text, newId = () => "call_" + Math.random().toString(36).s
   }
   for (const c of lifted) calls.push({ id: newId(), type: "function", function: c })
 
-  const cleaned = calls.length ? rest.replace(/```[a-z]*\s*```/gi, "") : rest
+  const cleaned = calls.length ? rest.replace(/```[a-z0-9_-]*\s*```/gi, "") : rest
   return { text: calls.length ? cleaned.trim() : rest, calls, raw: rest }
 }

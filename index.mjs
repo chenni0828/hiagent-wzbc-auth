@@ -470,6 +470,7 @@ export function createPlugin({
           }
 
           const prompt = flatten(body)
+          const parseTools = Array.isArray(body?.tools) && body.tools.length > 0 && body?.tool_choice !== "none"
           const id = "chatcmpl-" + Math.random().toString(36).slice(2)
           const promptTokens = () => Math.ceil(prompt.length / 3)
           const maxTokens = body.max_completion_tokens ?? body.max_tokens
@@ -481,6 +482,7 @@ export function createPlugin({
                 model: resolved.id,
                 signal,
                 newId,
+                parseTools,
                 promptTokens,
                 ask: (onUpdate, sig) =>
                   s.ask(prompt, { model: resolved.model, maxTokens, signal: sig, onUpdate }),
@@ -488,7 +490,7 @@ export function createPlugin({
             }
             const final = await s.ask(prompt, { model: resolved.model, maxTokens, signal })
             return Response.json(
-              completion({ id, model: resolved.id, final, promptTokens: promptTokens(), newId }),
+              completion({ id, model: resolved.id, final, promptTokens: promptTokens(), newId, parseTools }),
             )
           } catch (e) {
             return mapError(e)
