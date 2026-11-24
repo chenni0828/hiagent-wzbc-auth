@@ -1,0 +1,38 @@
+{
+  "name": "hiagent-wzbc-auth",
+  "version": "0.1.0",
+  "description": "HiAgent (agent.wzbc.edu.cn) provider plugin for Magpie and OpenCode: browser SSO login, pasted Cookie, or AI Gateway API key with live models (including Kimi-K3.1-Pro), SSE streaming, reasoning, and tool calls",
+  "homepage": "https://github.com/chenni0828/hiagent-wzbc-auth#readme",
+  "type": "module",
+  "main": "./opencode.mjs",
+  "exports": {
+    ".": "./opencode2.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "hiagent.mjs",
+    "browser.mjs",
+    "openai.mjs",
+    "prompt.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chenni0828/hiagent-wzbc-auth.git"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "magpie-plugin",
+    "hiagent",
+    "kimi"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "maxConcurrency": 4
+  }
+}
